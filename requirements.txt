@@ -10,3 +10,4 @@ tensorflow>=2.13.0
 gunicorn>=21.2.0
 pymongo>=4.0.0
 python-dotenv
+gunicorn==26.0.0
