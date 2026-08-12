@@ -6,12 +6,16 @@ import base64
 from datetime import timedelta
 from functools import wraps
 import re
+import bcrypt
+import pymongo
 
+
+
+from dotenv import load_dotenv
+load_dotenv()
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
 from flask_session import Session
 from werkzeug.utils import secure_filename
-import bcrypt
-import mysql.connector
 
 # ── Force CPU for TensorFlow ─────────────────────────────────────────────
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
@@ -21,6 +25,8 @@ try:
     import numpy as np
     import h5py
     from PIL import Image
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     ML_AVAILABLE = True
@@ -28,18 +34,14 @@ except ImportError:
     ML_AVAILABLE = False
     print("[WARN] TensorFlow or dependencies not installed.")
 
-# ── MySQL Connection ─────────────────────────────────────────────────────
-db = mysql.connector.connect(
-    host="localhost",
-    user="root",
-    password="YOUR Password",
-    database="brain_app"
-)
-cursor = db.cursor(dictionary=True)
+# ── MongoDB Connection ──────────────────────────────────────────────────
+mongo_client = pymongo.MongoClient(os.environ["MONGO_URI"])
+db = mongo_client["brain_app"]
+users = db["users"]
 
 # ── Flask setup ─────────────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(32)
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
 app.config.update(
     SESSION_TYPE="filesystem",
@@ -136,9 +138,13 @@ def run_prediction(filepath):
     # --- Preprocessing ---
     if ext == "h5":
         with h5py.File(filepath, "r") as f:
-            image = f["image"][:] 
+            image = f["image"][:]
+            ground_truth = f["mask"][:]
+
         image = image.astype(np.float32)
+        ground_truth = (ground_truth > 0).astype(np.uint8)
     else:
+        ground_truth = None
         # 1. Load and Resize
         img = Image.open(filepath).convert("L").resize((240, 240))
         arr = np.array(img).astype(np.float32)
@@ -159,7 +165,28 @@ def run_prediction(filepath):
     # ADJUSTED THRESHOLD for broader detection sensitivity
     mask = (seg_pred > 0.3).astype(np.uint8) 
     tumor_fraction = float(mask.max(axis=-1).mean())
+    
+    # Calculate actual Dice score when ground truth is available
+    dice_score = None
 
+    if ground_truth is not None:
+        predicted_mask = mask.max(axis=-1)
+
+    # Make sure ground truth is 2D
+        if ground_truth.ndim == 3:
+            ground_truth = ground_truth.max(axis=-1)
+
+        intersection = np.sum(predicted_mask * ground_truth)
+        predicted_pixels = np.sum(predicted_mask)
+        ground_truth_pixels = np.sum(ground_truth)
+
+        if predicted_pixels == 0 and ground_truth_pixels == 0:
+            dice_score = 1.0
+        else:
+            dice_score = (
+            (2.0 * intersection) /
+            (predicted_pixels + ground_truth_pixels)
+        )   
     # 2. Grading (Logic for results display)
     if tumor_fraction > 0.00005: # Detection limit
         grade_score = float(grad_model.predict(input_tensor, verbose=0)[0][0])
@@ -204,7 +231,7 @@ def run_prediction(filepath):
         "insight": insights["insight"],
         "grade_probs": insights["probs"],
         "staging_method": "ML Classifier",
-        "dice": round(0.82 + (np.random.random() * 0.1), 2)
+        "dice": round(float(dice_score), 2) if dice_score is not None else None
     }
 
 # ── Routes ─────────────────────────────────────────────────────────
@@ -215,44 +242,41 @@ def index():
 @app.route("/register", methods=["GET", "POST"])
 def register():
     if request.method == "POST":
-        username = request.form.get("username").lower()
-        email = request.form.get("email")
-        password = request.form.get("password")
-        confirm = request.form.get("confirm")
+        username = request.form.get("username", "").strip().lower()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
 
-        # 1. Check if passwords match
-        if password != confirm:
-            flash("Passwords do not match")
-            return redirect(url_for("register"))
-
-        # 2. PASSWORD STRENGTH VALIDATION
-        # Requirements: 8 chars, 1 uppercase, 1 number, 1 special char
-        password_regex = r"^(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$"
-        
-        if not re.match(password_regex, password):
-            flash("Password must be at least 8 characters long, include one uppercase letter, one number, and one special character.")
-            return redirect(url_for("register"))
-
-        # 3. Proceed with hashing and database insertion
-        password_hash = hash_password(password)
         try:
-            cursor.execute("INSERT INTO users (username, email, password_hash) VALUES (%s, %s, %s)",
-                           (username, email, password_hash))
-            db.commit()
+            # Check if username already exists
+            if users.find_one({"username": username}):
+                flash("Username already exists")
+                return redirect(url_for("register"))
+
+            # Hash password
+            password_hash = hash_password(password)
+
+            # Create user
+            users.insert_one({
+                "username": username,
+                "email": email,
+                "password_hash": password_hash
+            })
+
             flash("Registered successfully")
             return redirect(url_for("login"))
-        except:
-            flash("Username already exists")
-            
-    return render_template("register.html")
 
+        except Exception as e:
+            print("REGISTRATION ERROR:", repr(e))
+            flash("Registration failed")
+            return redirect(url_for("register"))
+
+    return render_template("register.html")
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
         username = request.form.get("username").lower()
         password = request.form.get("password")
-        cursor.execute("SELECT * FROM users WHERE username=%s", (username,))
-        user = cursor.fetchone()
+        user = users.find_one({"username": username})
         if user and check_password(password, user["password_hash"]):
             session["user"] = username
             return redirect(url_for("dashboard"))
@@ -286,4 +310,5 @@ def predict():
     return jsonify({"error": "Invalid file format"})
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5001)))
